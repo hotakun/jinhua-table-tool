@@ -1,0 +1,21 @@
+[package]
+name = "jinhua-engine"
+version = "2.0.0"
+edition = "2021"
+
+[lib]
+name = "jinhua_engine"
+crate-type = ["cdylib"]
+path = "src/engine.rs"
+
+[dependencies]
+calamine = "0.26"
+rust_xlsxwriter = "0.79"
+chrono = "0.4"
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1

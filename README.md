@@ -44,15 +44,37 @@
 
 ---
 
+## 源码结构
+
+```
+D2Y-pyqt/                        # 当前发布主线：PySide6 版
+├── main.py                      #   GUI 主程序（单文件）
+├── 开发文档.md                  #   开发文档（v3.1.2，含列识别规则/构建发布流程）
+├── README.md                    #   与 tkinter 版的对比说明
+├── JinhuaH.spec / build_exe.bat #   PyInstaller 打包
+└── setup.iss / Default.isl      #   Inno Setup 安装包脚本
+
+D2Y/                             # Rust 引擎 + tkinter 版
+├── Rust/src/engine.rs           #   全部业务逻辑（读/写 Excel、8 步流水线、统计）
+├── Rust/Cargo.toml              #   crate-type = ["cdylib"]
+├── Rust/build.bat               #   编译 DLL 并复制到两个 GUI 目录
+├── 金华聚火表格处理_hybrid.py   #   tkinter GUI（v2.0.x，带自动更新检测）
+├── 开发文档.md                  #   v1.x / v2.0 开发文档
+└── setup.iss / setup_hybrid.iss #   旧版安装脚本
+
+开发文档.md                       # v1.x 时代文档（历史保留）
+金华聚火表格处理_整合版_fixed.py  # v1.3 纯 Python 实现（历史保留）
+```
+
+- 引擎：Rust（calamine 读 .xls/.xlsx、rust_xlsxwriter 写 .xlsx），经 ctypes 以 DLL 直调，零子进程
+- `jinhua_engine.dll`、`MLSX.gif`、`favicon.ico` 等二进制未入库，构建步骤见 `D2Y-pyqt/开发文档.md`
+- 两个 GUI（tkinter / PySide6）**共用同一份 DLL**，引擎改动会同时影响两者
+
+---
+
 ## 版本历史
 
 - **v3.1.2**（当前）：修复「外部订单号」列抢占订单号列导致的匹配明细 0 单 / 输出订单号列空白
 - **v2.7.0**：未付款客户在备注与订单状态中标注 `♣`
 - **v2.0.1 / v2.0**：Python + Rust 融合架构（DLL FFI），移除 pandas，启动速度大幅提升
 - **v1.3 / v1.2 / v1.1 / v1.0**：纯 Python（tkinter + pandas）版本
-
-## 技术说明
-
-- 界面：PySide6（Qt for Python），支持明暗主题、启动动画、商品明细表格
-- 引擎：Rust（calamine 读 .xls/.xlsx、rust_xlsxwriter 写 .xlsx），通过 ctypes 以 DLL 方式直调，零子进程
-- 仓库内 `开发文档.md` 为 v1.x 时代的开发文档；`金华聚火表格处理_整合版_fixed.py` 为 v1.3 纯 Python 实现
