@@ -1,10 +1,10 @@
-# D2Y-pyqt — PySide6 版（v3.1.2，发布主线）
+# D2Y-pyqt — PySide6 版（v3.1.3，发布主线）
 
 与 `D2Y/` 的 ttkbootstrap 版**共用同一份 Rust 引擎 DLL**（`jinhua_engine.dll`，源码在 `..\D2Y\Rust\src\engine.rs`），GUI 层用 PySide6 重写。
 最初是对比练习项目，现已转正为发布主线。详细设计见 `开发文档.md`。
 
-- 最新安装包：[GitHub Releases v3.1.2](https://github.com/hotakun/jinhua-table-tool/releases/tag/v3.1.2)
-- 本地安装包：`installer/金华聚火表格处理_v3.1.2_Setup.exe`
+- 上一个安装包：[GitHub Releases v3.1.2](https://github.com/hotakun/jinhua-table-tool/releases/tag/v3.1.2)
+- 本地安装包：`installer/金华聚火表格处理_v3.1.3_Setup.exe`（v3.1.3 待打包发布）
 
 ## 文件结构
 
@@ -34,7 +34,7 @@ python main.py
 | 维度 | ttkbootstrap (D2Y/) | PySide6 (D2Y-pyqt/) |
 |------|---------------------|----------------------|
 | **框架** | tkinter + ttkbootstrap cosmo | PySide6 (Qt for Python) |
-| **代码行数** | 496 行（hybrid.py） | 1155 行（main.py，含 QSS） |
+| **代码行数** | 496 行（hybrid.py） | 单文件 main.py（含 QSS 与更新逻辑） |
 | **启动动画** | 无 | MLSX.gif Splash Screen |
 | **主题** | cosmo（20+ 预设改一个字符串） | Fusion + 自定义 QSS + 暗色模式切换 |
 | **进度条** | ttk.Progressbar bootstyle="success-striped" | QProgressBar + QSS 圆角绿色条纹 |
@@ -50,7 +50,7 @@ python main.py
 | **窗口可缩放** | 固定 620×880 | 最小 580×680，可拉伸 |
 | **表格功能** | 无 | 点击表头排序、Ctrl+C 复制、列宽拖拽 |
 | **操作日志** | 无 | SQLite（D:\订单表格\logs\operations.db） |
-| **自动更新提示** | 有（读 releases/latest） | 无（v3.1.x 已移除该代码） |
+| **自动更新提示** | 有（读 releases/latest） | 有（v3.1.3 起：? 旁 ⬆ 按钮，可检查/下载/向导安装） |
 | **许可证** | MIT | LGPL（PySide6） |
 
 ## 功能清单
@@ -64,8 +64,9 @@ python main.py
 - [x] QThread + 信号槽对接 Rust DLL
 - [x] 进度条平滑更新
 - [x] Ctrl+Enter 执行 / Esc 关闭快捷键
-- [ ] GitHub 自动更新检测（**PySide6 版未实现**；tkinter v2.0.1 仍带此项，见开发文档第二节）
-- [ ] 标题双击手动检查更新（同上，未实现）
+- [x] 更新按钮（v3.1.3）：? 旁 ⬆ 检查更新，下载到 `D:\订单表格\Update\` 并启动安装向导
+- [x] 启动静默检查更新（仅按钮/状态栏提醒，无网不打扰）
+- [x] 列识别容错与诊断（v3.1.3：别名表 + 致命问题默认中止 + 「仍然生成」）
 - [x] SQLite 操作日志
 - [x] TXT 导出 + os.startfile 打开
 - [x] 关闭确认对话框
@@ -80,4 +81,9 @@ python main.py
 
 ## 版本要点
 
-- **v3.1.2**（已发布）：修复「外部订单号」列抢占订单号列导致的 **匹配明细 0 单 / 输出模板订单号列空白**（根因与影响面见 `开发文档.md` 第四节"销售订单列识别"）
+- **v3.1.3**（待发布）：弹性容错 + 异常定位
+  - 引擎列识别改为「别名表 + 表头精确优先两轮探测」，取消「结账状态按列号兜底」
+  - 返回 `errors/warnings` 诊断（含列号、列名、非空率、候选列）；致命问题（缺列/表头识别失败/订单号列可疑/匹配明细 0 单）默认**中止且不出文件**，弹窗可「仍然生成」
+  - 新增 ⬆ 更新按钮：启动静默检查 + 手动检查，下载到 `D:\订单表格\Update\`，校验大小与 PE 头后启动安装向导
+  - 引擎拆分为 `engine.rs` + `sales.rs` + `output.rs`
+- **v3.1.2**（已发布）：修复「外部订单号」列抢占订单号列导致的 **匹配明细 0 单 / 输出模板订单号列空白**（根因与影响面见 `开发文档.md` 第四节）

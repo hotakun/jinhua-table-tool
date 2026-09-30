@@ -12,6 +12,9 @@ import ctypes
 import threading
 import time
 import sqlite3
+import ssl
+import urllib.request
+import urllib.error
 from datetime import datetime
 
 from PySide6.QtWidgets import (
@@ -22,21 +25,25 @@ from PySide6.QtWidgets import (
     QHeaderView, QGraphicsDropShadowEffect,
 )
 from PySide6.QtCore import (
-    Qt, QPoint, QThread, Signal, QTimer, QPropertyAnimation, QEasingCurve,
+    Qt, QPoint, QUrl, QThread, Signal, QTimer, QPropertyAnimation, QEasingCurve,
 )
 from PySide6.QtGui import (
     QFont, QIcon, QPixmap, QMovie, QColor, QPalette,
-    QShortcut, QKeySequence,
+    QShortcut, QKeySequence, QDesktopServices,
 )
 
 # ============================================================================
 # 常量
 # ============================================================================
-CURRENT_VERSION = "3.1.2"
+CURRENT_VERSION = "3.1.3"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 操作日志数据库
 LOG_DB_DIR = r"D:\订单表格\logs"
 LOG_DB_PATH = os.path.join(LOG_DB_DIR, "operations.db")
+# 更新检查 / 下载（v3.1.3 新增）
+UPDATE_API = "https://api.github.com/repos/hotakun/jinhua-table-tool/releases/latest"
+UPDATE_PAGE = "https://github.com/hotakun/jinhua-table-tool/releases/latest"
+UPDATE_DIR = r"D:\订单表格\Update"
 
 # ============================================================================
 # 工具函数（与原版复用逻辑）
@@ -115,6 +122,76 @@ def _pad(s, target_w):
 
 # Rust 引擎统计列宽度: name=46, spec=36, unit=10, qty(右对齐)=6
 STATS_W = (46, 36, 10, 6)
+
+
+# ── 版本比较与更新检查（v3.1.3 新增）──
+def _ver_key(v):
+    """把 'v3.1.2' / 'V2.7.0' 这类版本号转成可比较的数值元组（大小写 v 都容错）"""
+    parts = []
+    for seg in (v or "").strip().lstrip("vV").split("."):
+        digits = "".join(ch for ch in seg if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts) if parts else (0,)
+
+def _ver_newer(a, b):
+    return _ver_key(a) > _ver_key(b)
+
+_ssl_ctx = None
+
+def _fetch(url, timeout=15):
+    """带 SSL 容错的 GET"""
+    global _ssl_ctx
+    req = urllib.request.Request(url, headers={"User-Agent": "JinhuaJuhuo"})
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except ssl.SSLError:
+        if _ssl_ctx is None:
+            _ssl_ctx = ssl.create_default_context()
+            _ssl_ctx.check_hostname = False
+            _ssl_ctx.verify_mode = ssl.CERT_NONE
+        return urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx)
+
+def check_update():
+    """检查更新，返回 (status, info)：
+         ("new",    {版本信息})  有新版本
+         ("latest", None)        已是最新
+         ("fail",   None)        网络或接口异常
+    """
+    try:
+        with _fetch(UPDATE_API) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        tag = (data.get("tag_name") or "").strip()
+        if not tag or not _ver_newer(tag, CURRENT_VERSION):
+            return ("latest", None)
+        for a in data.get("assets", []):
+            name = a.get("name", "") or ""
+            if name.lower().endswith(".exe") and "Setup" in name:
+                return ("new", {
+                    "version": tag.lstrip("vV"),
+                    "name": name,
+                    "url": a.get("browser_download_url") or "",
+                    "size": int(a.get("size") or 0),
+                    "page": UPDATE_PAGE,
+                })
+        return ("latest", None)
+    except Exception:
+        return ("fail", None)
+
+def _diags_text(data):
+    """把引擎返回的 errors/warnings 拼成可读文本（含出错字段、原因与定位信息）"""
+    out = []
+    for tag, label in (("errors", "错误"), ("warnings", "警告")):
+        items = (data or {}).get(tag) or []
+        if not items:
+            continue
+        out.append("【%s】" % label)
+        for i, d in enumerate(items, 1):
+            out.append("%d. %s — %s" % (i, d.get("field", ""), d.get("problem", "")))
+            det = (d.get("detail") or "").strip()
+            if det:
+                out.append("    " + det)
+        out.append("")
+    return "\n".join(out).strip() or "（无诊断信息）"
 
 # ============================================================================
 # QSS 样式表
@@ -446,18 +523,28 @@ class EngineWorker(QThread):
     progress_updated = Signal(int, str, str)   # pct, label, percentage_str
     stats_received = Signal(int, list)          # total, lines
     engine_finished = Signal(dict)              # result_json
-    engine_error = Signal(str)                  # error message
+    engine_error = Signal(str, dict)            # error message + 完整结果(含诊断)
 
-    def __init__(self, dll_path, delete_files, show_stats, parent=None):
+    def __init__(self, dll_path, delete_files, show_stats, force=False, parent=None):
         super().__init__(parent)
         self.dll_path = dll_path
         self.delete_files = delete_files
         self.show_stats = show_stats
+        self.force = force          # True = 忽略致命列识别问题继续生成（「仍然生成」）
 
     def run(self):
         try:
-            for d in [r'D:\订单表格', r'D:\明细表格', r'D:\明细表格\MXBG2']:
+            for d in [r'D:\订单表格', r'D:\明细表格', r'D:\明细表格\MXBG2', UPDATE_DIR]:
                 os.makedirs(d, exist_ok=True)
+
+            # 先把商品汇总需要的数据读出来（引擎随后可能按勾选清空 D:\明细表格，
+            # 清完就再也算不出「商品 × 客户」了）
+            self.summary_data = None
+            try:
+                import summary
+                self.summary_data = summary.collect(quiet=True)
+            except Exception:
+                self.summary_data = None
 
             lib = ctypes.CDLL(self.dll_path)
             CB = ctypes.CFUNCTYPE(None, ctypes.c_uint32, ctypes.c_char_p)
@@ -476,33 +563,42 @@ class EngineWorker(QThread):
                 except Exception:
                     pass  # 单条 stats 数据解析失败不影响整体
 
-            lib.engine_process.argtypes = [ctypes.c_uint8, ctypes.c_uint8, CB]
+            lib.engine_process.argtypes = [ctypes.c_uint8, ctypes.c_uint8, ctypes.c_uint8, CB]
             lib.engine_process.restype = ctypes.c_void_p
             lib.engine_free.argtypes = [ctypes.c_void_p]
 
             self.progress_updated.emit(5, "引擎处理中...", "5%")
             delete = 1 if self.delete_files else 0
             stats = 1 if self.show_stats else 0
-            ptr = lib.engine_process(delete, stats, progress_cb)
+            force = 1 if self.force else 0
+            ptr = lib.engine_process(delete, stats, force, progress_cb)
             result_json = ctypes.cast(ptr, ctypes.c_char_p).value.decode('utf-8')
             lib.engine_free(ptr)
 
             result_data = json.loads(result_json)
+            result_data["_summary"] = self.summary_data   # 供「打开并退出」时生成 HTML
             if "error" in result_data:
-                self.engine_error.emit(result_data["error"])
+                self.engine_error.emit(result_data["error"], result_data)
             else:
                 self.engine_finished.emit(result_data)
 
         except OSError as e:
-            self.engine_error.emit(f"Rust引擎DLL加载失败: {str(e)}")
+            self.engine_error.emit(f"Rust引擎DLL加载失败: {str(e)}", {})
         except Exception as e:
-            self.engine_error.emit(f"引擎异常: {str(e)}")
+            self.engine_error.emit(f"引擎异常: {str(e)}", {})
 
 
 # ============================================================================
 # 主窗口
 # ============================================================================
 class JinhuaPyQtApp(QMainWindow):
+    # 后台线程 → 主线程的结果回传（QTimer 在没有事件循环的子线程里不会触发，
+    # 必须用 Qt 信号跨线程排队，否则界面收不到任何更新结果）
+    update_checked = Signal(str, object)             # status(new/latest/fail), info
+    update_progress = Signal(int)                   # 下载百分比
+    update_downloaded = Signal(str, bool, bool)     # dest, size_ok, pe_ok
+    update_failed = Signal(str)                     # 错误信息
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"金华聚火表格处理 v{CURRENT_VERSION}")
@@ -525,10 +621,29 @@ class JinhuaPyQtApp(QMainWindow):
         self.detail_stats_lines = []
         self.detail_stats_total = 0
         self.output_file_path = ""
+        self.update_info = None       # 发现的新版本信息
+        self.is_downloading = False
+        self._manual_check = False    # 区分启动静默检查与手动点击检查
 
         self._setup_ui()
         self._setup_statusbar()
         self._setup_shortcuts()
+
+        # 检查/下载期间按钮转圈，让用户看得出程序在动
+        self._spin_frames = ["◐", "◓", "◑", "◒"]
+        self._spin_idx = 0
+        self._spin_timer = QTimer(self)
+        self._spin_timer.setInterval(180)
+        self._spin_timer.timeout.connect(self._spin_step)
+
+        # 跨线程信号接到主线程槽
+        self.update_checked.connect(self._on_update_checked)
+        self.update_progress.connect(self._on_update_progress)
+        self.update_downloaded.connect(self._on_update_downloaded)
+        self.update_failed.connect(self._on_update_failed)
+
+        # 启动 1.5s 后静默检查更新：发现新版只在按钮/状态栏提示，无网或失败不提示
+        QTimer.singleShot(1500, self._check_update_silent)
 
     # ── UI 构建 ──────────────────────────────────────────────
     def _setup_ui(self):
@@ -580,6 +695,14 @@ class JinhuaPyQtApp(QMainWindow):
         h_layout = QHBoxLayout()
         h_layout.addStretch()
 
+        # 更新按钮（在 ? 左边）
+        self.update_btn = QToolButton()
+        self.update_btn.setObjectName("themeBtn")
+        self.update_btn.setText("↻")
+        self.update_btn.setToolTip("检查更新")
+        self.update_btn.setFixedSize(32, 32)
+        self.update_btn.clicked.connect(self._on_update_clicked)
+
         # 帮助按钮（右上角，? 旁边是暗色模式按钮）
         self.help_btn = QToolButton()
         self.help_btn.setObjectName("themeBtn")
@@ -608,9 +731,178 @@ class JinhuaPyQtApp(QMainWindow):
 
         h_layout.addLayout(title_layout)
         h_layout.addStretch()
+        h_layout.addWidget(self.update_btn, alignment=Qt.AlignTop)
         h_layout.addWidget(self.help_btn, alignment=Qt.AlignTop)
         h_layout.addWidget(self.theme_btn, alignment=Qt.AlignTop)
         self.main_layout.addLayout(h_layout)
+
+    # ── 更新检查与下载（v3.1.3）──────────────────────────────
+    def _start_spin(self):
+        """按钮转圈，表示正在检查/下载"""
+        self._spin_idx = 0
+        self.update_btn.setText(self._spin_frames[0])
+        self._spin_timer.start()
+
+    def _spin_step(self):
+        self._spin_idx = (self._spin_idx + 1) % len(self._spin_frames)
+        self.update_btn.setText(self._spin_frames[self._spin_idx])
+
+    def _stop_spin(self):
+        self._spin_timer.stop()
+        self.update_btn.setText("↓" if self.update_info else "↻")
+
+    def _check_update_silent(self):
+        """启动时静默检查：只在发现新版时给按钮加提示，失败/无网一律不打扰"""
+        self._manual_check = False
+        threading.Thread(target=lambda: self.update_checked.emit(*check_update()),
+                         daemon=True).start()
+
+    def _on_update_clicked(self):
+        """点击 ↻ / ↓：手动检查更新（必须有明确反馈）"""
+        if self.is_downloading:
+            return
+        self._manual_check = True
+        self.status_label_sb.setText("正在检查更新...")
+        self.update_btn.setEnabled(False)
+        self._start_spin()
+        threading.Thread(target=lambda: self.update_checked.emit(*check_update()),
+                         daemon=True).start()
+
+    def _on_update_checked(self, status, info):
+        """主线程槽：后台检查完成后回到这里（静默检查只在有新版时提示）"""
+        if not self._manual_check:
+            if status == "new" and info:
+                self._mark_update_available(info)
+            return
+        self._after_check(status, info)
+
+    def _mark_update_available(self, info):
+        self.update_info = info
+        self.update_btn.setText("↓")
+        self.update_btn.setToolTip("有新版本 v%s，点击更新" % info["version"])
+        self.status_label_sb.setText("有新版本 v%s（点 ↓ 更新）" % info["version"])
+
+    def _after_check(self, status, info):
+        self.update_btn.setEnabled(True)
+        self._stop_spin()
+        # 网络/接口异常：与“已是最新”区分开
+        if status == "fail":
+            self.status_label_sb.setText("检查更新失败")
+            box = QMessageBox(self)
+            box.setWindowTitle("检查更新")
+            box.setIcon(QMessageBox.Warning)
+            box.setText("检查更新失败，请检查网络后重试。")
+            page_btn = box.addButton("打开下载页面", QMessageBox.ActionRole)
+            box.addButton("关闭", QMessageBox.RejectRole)
+            box.exec()
+            if box.clickedButton() is page_btn:
+                QDesktopServices.openUrl(QUrl(UPDATE_PAGE))
+            return
+        if status != "new" or not info:
+            if self.update_info:
+                info = self.update_info
+            else:
+                self.status_label_sb.setText("已是最新版本")
+                QMessageBox.information(self, "检查更新",
+                    "当前已是最新版本 v%s" % CURRENT_VERSION)
+                return
+        self.update_info = info
+        self._mark_update_available(info)
+        box = QMessageBox(self)
+        box.setWindowTitle("发现新版本")
+        box.setIcon(QMessageBox.Information)
+        box.setText("发现新版本 v%s，是否下载安装？" % info["version"])
+        dl_btn = box.addButton("下载并安装", QMessageBox.AcceptRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is dl_btn:
+            self._download_update(info)
+
+    def _download_update(self, info):
+        if not info.get("url"):
+            QDesktopServices.openUrl(QUrl(info["page"]))
+            return
+        self.is_downloading = True
+        self.update_btn.setEnabled(False)
+        self._start_spin()
+        os.makedirs(UPDATE_DIR, exist_ok=True)
+        dest = os.path.join(UPDATE_DIR, info["name"])
+
+        def work():
+            try:
+                with _fetch(info["url"], timeout=60) as resp, open(dest, "wb") as f:
+                    total = int(resp.headers.get("content-length") or 0)
+                    got = 0
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        got += len(chunk)
+                        if total > 0:
+                            self.update_progress.emit(int(got * 100 / total))
+                size_ok = (not info.get("size")) or os.path.getsize(dest) == info["size"]
+                with open(dest, "rb") as f:
+                    pe_ok = f.read(2) == b"MZ"
+                self.update_downloaded.emit(dest, size_ok, pe_ok)
+            except Exception as e:
+                self.update_failed.emit(str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ── 下载过程中的三个主线程槽 ──
+    def _on_update_progress(self, pct):
+        self.status_label_sb.setText("正在下载更新... %d%%" % pct)
+
+    def _on_update_downloaded(self, dest, size_ok, pe_ok):
+        self._after_download(dest, size_ok, pe_ok)
+
+    def _on_update_failed(self, err):
+        self._download_failed(err)
+
+    def _after_download(self, dest, size_ok, pe_ok):
+        self.is_downloading = False
+        self.update_btn.setEnabled(True)
+        self._stop_spin()
+        if not size_ok or not pe_ok:
+            try:
+                os.remove(dest)
+            except Exception:
+                pass
+            self.status_label_sb.setText("下载失败，请重试")
+            QMessageBox.warning(self, "更新失败", "下载的文件不完整，请重试。")
+            return
+        self.status_label_sb.setText("更新包已下载")
+        box = QMessageBox(self)
+        box.setWindowTitle("下载完成")
+        box.setIcon(QMessageBox.Information)
+        box.setText("已下载完成，现在安装吗？")
+        box.setInformativeText("安装前本程序会自动退出。")
+        now_btn = box.addButton("立即安装", QMessageBox.AcceptRole)
+        box.addButton("稍后", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is now_btn:
+            try:
+                os.startfile(dest)
+            except Exception:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(dest))
+            self.close()
+
+    def _download_failed(self, err, info=None):
+        self.is_downloading = False
+        self.update_btn.setEnabled(True)
+        self._stop_spin()
+        self.status_label_sb.setText("下载失败，请重试")
+        page = (info or {}).get("page") or (self.update_info or {}).get("page") or UPDATE_PAGE
+        box = QMessageBox(self)
+        box.setWindowTitle("下载失败")
+        box.setIcon(QMessageBox.Warning)
+        box.setText("更新包下载失败，请稍后重试。")
+        page_btn = box.addButton("打开下载页面", QMessageBox.ActionRole)
+        box.addButton("关闭", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is page_btn:
+            QDesktopServices.openUrl(QUrl(page))
 
     def _show_path_popup(self):
         """在 ? 按钮下方弹出路径说明浮层，点击外部自动关闭。"""
@@ -813,7 +1105,7 @@ class JinhuaPyQtApp(QMainWindow):
         self.setStyleSheet(DARK_QSS if self.is_dark else LIGHT_QSS)
 
     # ── 执行逻辑 ────────────────────────────────────────────
-    def _execute(self):
+    def _execute(self, force=False):
         if self.is_running:
             return
         self.is_running = True
@@ -841,8 +1133,9 @@ class JinhuaPyQtApp(QMainWindow):
             self._reset_ui()
             return
 
-        # 启动工作线程
-        self.worker = EngineWorker(dll, self.delete_cb.isChecked(), self.stats_cb.isChecked())
+        # 启动工作线程（force=True = 「仍然生成」：忽略致命列识别问题继续出文件）
+        self.worker = EngineWorker(dll, self.delete_cb.isChecked(), self.stats_cb.isChecked(),
+                                   force=force)
         self.worker.progress_updated.connect(self._on_progress)
         self.worker.stats_received.connect(self._on_stats)
         self.worker.engine_finished.connect(self._on_finished)
@@ -905,8 +1198,16 @@ class JinhuaPyQtApp(QMainWindow):
         )
         self.is_running = False
 
-    def _on_error(self, msg):
-        # 记录错误日志
+    def _on_error(self, msg, data=None):
+        data = data or {}
+        diag_txt = _diags_text(data)
+        fatal = bool(data.get("fatal"))
+        # 中断也要把诊断显示在结果页，便于对照排查
+        try:
+            self._display_result(data)
+        except Exception:
+            pass
+        # 诊断写入操作日志（截断，避免撑爆字段）
         try:
             duration = int((time.time() - self._op_start_time) * 1000)
         except Exception:
@@ -915,18 +1216,32 @@ class JinhuaPyQtApp(QMainWindow):
             op_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             operator=os.getlogin(),
             status="error",
-            orders=0,
-            customers=0,
-            products=0,
-            matched=0,
+            orders=data.get("orders", 0),
+            customers=data.get("customers", 0),
+            products=data.get("products", 0),
+            matched=data.get("matched", 0),
             output_file="",
             stats_enabled=1 if self.stats_cb.isChecked() else 0,
             delete_enabled=1 if self.delete_cb.isChecked() else 0,
-            error_msg=msg,
+            error_msg=(msg + " | " + diag_txt)[:4000],
             duration_ms=duration,
         )
         self._reset_ui()
-        QMessageBox.critical(self, "错误", msg)
+
+        box = QMessageBox(self)
+        box.setWindowTitle("执行中止" if fatal else "错误")
+        box.setIcon(QMessageBox.Critical if fatal else QMessageBox.Warning)
+        box.setText(msg)
+        if fatal:
+            box.setInformativeText(
+                "已中止，未生成输出文件（避免错误数据被导入优路达）。\n"
+                "下面是定位到的具体问题；确认可以接受时也可选择「仍然生成」继续出文件。")
+        box.setDetailedText(diag_txt)
+        force_btn = box.addButton("仍然生成", QMessageBox.AcceptRole) if fatal else None
+        box.addButton("取消", QMessageBox.RejectRole)
+        box.exec()
+        if force_btn is not None and box.clickedButton() is force_btn:
+            self._execute(force=True)
 
     # ── 结果显示 ────────────────────────────────────────────
     def _display_result(self, d):
@@ -936,23 +1251,55 @@ class JinhuaPyQtApp(QMainWindow):
         matched = d.get("matched", 0)
         products = d.get("products", 0)
         no_coords = d.get("no_coords", [])
+        err = d.get("error")
+        fatal = bool(d.get("fatal"))
+        errors = d.get("errors") or []
+        warnings = d.get("warnings") or []
 
-        ok = (matched == orders)
-        status_style = "" if ok else " style='color:red;'"
-        status_text = "处理完成！" if ok else "处理未正确完成"
-        html = f"<h3{status_style}>{status_text}</h3>"
-        html += f"<p><b>生成文件:</b> {fname}</p>"
-        html += f"<hr>"
-        html += f"<p>处理订单数: <b>{orders}</b> 单</p>"
+        # ── 诊断区块：红=致命问题、黄=警告，都带出错字段与定位信息 ──
+        diag_html = ""
+        if errors:
+            diag_html += ("<br><p style='color:#c0392b;font-weight:bold;'>"
+                          "❌ 致命问题（列识别 / 数据校验）</p><ul style='color:#c0392b;'>")
+            for e in errors:
+                diag_html += "<li><b>%s</b>：%s" % (e.get("field", ""), e.get("problem", ""))
+                if e.get("detail"):
+                    diag_html += "<br><span style='font-size:9pt;'>%s</span>" % e.get("detail")
+                diag_html += "</li>"
+            diag_html += "</ul>"
+        if warnings:
+            diag_html += ("<p style='color:#b9770e;font-weight:bold;'>"
+                          "⚠ 警告（已继续处理，建议核对）</p><ul style='color:#b9770e;'>")
+            for w in warnings:
+                diag_html += "<li><b>%s</b>：%s" % (w.get("field", ""), w.get("problem", ""))
+                if w.get("detail"):
+                    diag_html += "<br><span style='font-size:9pt;'>%s</span>" % w.get("detail")
+                diag_html += "</li>"
+            diag_html += "</ul>"
 
-        if not ok:
-            html += f"<p style='color:red;font-weight:bold;'>匹配明细: {matched} 单（{orders - matched} 单缺失）⚠</p>"
+        if err:
+            html = "<h3 style='color:red;'>执行中止</h3>"
+            html += "<p><b>原因:</b> %s</p>" % err
+            if fatal:
+                html += "<p>本次<b>未生成</b>输出文件。</p>"
+            html += "<p style='color:#555;'>处理订单数: %s 单；匹配明细: %s 单</p>" % (orders, matched)
         else:
-            html += f"<p>匹配明细: {matched} 单</p>"
+            ok = (matched == orders)
+            status_style = "" if ok else " style='color:red;'"
+            status_text = "处理完成！" if ok else "处理未正确完成"
+            html = f"<h3{status_style}>{status_text}</h3>"
+            html += f"<p><b>生成文件:</b> {fname}</p>"
+            html += f"<hr>"
+            html += f"<p>处理订单数: <b>{orders}</b> 单</p>"
+            if not ok:
+                html += f"<p style='color:red;font-weight:bold;'>匹配明细: {matched} 单（{orders - matched} 单缺失）⚠</p>"
+            else:
+                html += f"<p>匹配明细: {matched} 单</p>"
+            html += f"<p>合并后客户: <b>{customers}</b> 个</p>"
+            if products > 0:
+                html += f"<p>出库商品总数: <b>{products}</b></p>"
 
-        html += f"<p>合并后客户: <b>{customers}</b> 个</p>"
-        if products > 0:
-            html += f"<p>出库商品总数: <b>{products}</b></p>"
+        html += diag_html
 
         if no_coords:
             html += f"<br><p style='color:red;'><b>⚠ 未匹配经纬度的客户 ({len(no_coords)} 个):</b></p>"
@@ -1063,6 +1410,17 @@ class JinhuaPyQtApp(QMainWindow):
                     txt_content += line + "\n"
         with open(txt_path, 'w', encoding='utf-8') as f:
             f.write(txt_content)
+
+        # 同时生成手机友好的商品汇总 HTML（与 TXT 同一天一份；失败不影响 TXT 与主流程）
+        try:
+            import summary
+            data = (self.result_data or {}).get("_summary")
+            if data and not data.get("error"):
+                if summary.render(data, out_dir=detail_dir, quiet=True):
+                    self.status_label_sb.setText(
+                        "已生成：今日详情%s.txt ／ 商品汇总%s.html" % (today, today))
+        except Exception:
+            pass
 
         if self.output_file_path and os.path.exists(self.output_file_path):
             os.startfile(self.output_file_path)
