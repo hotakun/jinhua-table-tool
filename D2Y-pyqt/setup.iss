@@ -2,14 +2,14 @@
 [Setup]
 AppId=JinhuaJuhuo-Table-Tool
 AppName=金华聚火表格处理
-AppVersion=3.1.3
+AppVersion=3.2.0
 AppPublisher=订小易
 DefaultDirName={autopf}\金华聚火表格处理
 DefaultGroupName=金华聚火表格处理
 UsePreviousAppDir=yes
 DisableDirPage=no
 OutputDir=.\installer
-OutputBaseFilename=金华聚火表格处理_v3.1.3_Setup
+OutputBaseFilename=金华聚火表格处理_v3.2.0_Setup
 SetupIconFile=.\favicon.ico
 UninstallDisplayIcon={app}\_internal\favicon.ico
 Compression=lzma2/ultra64

@@ -1,6 +1,6 @@
 @echo off
 echo ========================================
-echo   JinhuaJuhuo v3.1.3 - PySide6 Build
+echo   JinhuaJuhuo v3.2.0 - PySide6 Build
 echo ========================================
 
 echo Checking Python...

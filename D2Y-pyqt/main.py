@@ -35,7 +35,7 @@ from PySide6.QtGui import (
 # ============================================================================
 # 常量
 # ============================================================================
-CURRENT_VERSION = "3.1.3"
+CURRENT_VERSION = "3.2.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 操作日志数据库
 LOG_DB_DIR = r"D:\订单表格\logs"
@@ -81,6 +81,17 @@ def init_db():
             duration_ms INTEGER
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS diagnostics (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            op_id      INTEGER,
+            op_time    TEXT,
+            level      TEXT,
+            field      TEXT,
+            problem    TEXT,
+            detail     TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -88,11 +99,11 @@ def log_operation(op_time, operator, status, orders=0, customers=0,
                   products=0, matched=0, output_file="",
                   stats_enabled=0, delete_enabled=0,
                   error_msg="", duration_ms=0):
-    """写入一条操作日志，失败不影响主流程"""
+    """写入一条操作日志，返回该记录 id（失败返回 0，不影响主流程）"""
     try:
         os.makedirs(LOG_DB_DIR, exist_ok=True)
         conn = sqlite3.connect(LOG_DB_PATH)
-        conn.execute("""
+        cur = conn.execute("""
             INSERT INTO operations
                 (op_time, operator, status, orders, customers,
                  products, matched, output_file, stats_enabled,
@@ -101,6 +112,27 @@ def log_operation(op_time, operator, status, orders=0, customers=0,
         """, (op_time, operator, status, orders, customers,
               products, matched, output_file, stats_enabled,
               delete_enabled, error_msg, duration_ms))
+        conn.commit()
+        rid = cur.lastrowid or 0
+        conn.close()
+        return rid
+    except Exception:
+        return 0
+
+def log_diagnostics(op_id, errors=(), warnings=(), op_time=""):
+    """把诊断明细写入 diagnostics 表，便于事后按字段检索（失败静默）"""
+    if not op_id:
+        return
+    try:
+        os.makedirs(LOG_DB_DIR, exist_ok=True)
+        conn = sqlite3.connect(LOG_DB_PATH)
+        rows = [("error", d) for d in errors] + [("warning", d) for d in warnings]
+        for level, d in rows:
+            conn.execute(
+                "INSERT INTO diagnostics (op_id, op_time, level, field, problem, detail)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (op_id, op_time, level, d.get("field", ""),
+                 d.get("problem", ""), d.get("detail", "")))
         conn.commit()
         conn.close()
     except Exception:
@@ -117,8 +149,35 @@ def _dwidth(s):
         w += 4 if o > 0x2E80 else 2
     return w
 
+def _numstr(v):
+    """数量显示：整数不带小数，否则保留两位"""
+    try:
+        f = float(v)
+    except Exception:
+        return str(v)
+    return str(int(f)) if f.is_integer() else ("%.2f" % f)
+
+
 def _pad(s, target_w):
-    return s + ' ' * max(0, target_w - _dwidth(s))
+    """按显示宽度补齐（中文=4、ASCII=2）。
+       关键：1 个空格只占 2 个宽度单位，所以补空格数 = 缺口 / 2；
+       超宽则按宽度截断并补 "…"，避免把后面的列顶歪。"""
+    w = _dwidth(s)
+    if w <= target_w:
+        return s + ' ' * max(0, (target_w - w) // 2)
+    limit = max(0, target_w - 2)
+    out, used = "", 0
+    for ch in s:
+        cw = 4 if ord(ch) > 0x2E80 else 2
+        if used + cw > limit:
+            break
+        out += ch
+        used += cw
+    out += "…"
+    used += 2
+    if used < target_w:
+        out += ' ' * ((target_w - used) // 2)
+    return out
 
 # Rust 引擎统计列宽度: name=46, spec=36, unit=10, qty(右对齐)=6
 STATS_W = (46, 36, 10, 6)
@@ -826,27 +885,39 @@ class JinhuaPyQtApp(QMainWindow):
         self.update_btn.setEnabled(False)
         self._start_spin()
         os.makedirs(UPDATE_DIR, exist_ok=True)
+        # 清掉以前下载的安装包（每个 ~37MB，不清会越积越多）
+        try:
+            for fn in os.listdir(UPDATE_DIR):
+                if fn.lower().endswith(".exe"):
+                    os.remove(os.path.join(UPDATE_DIR, fn))
+        except Exception:
+            pass
         dest = os.path.join(UPDATE_DIR, info["name"])
 
         def work():
-            try:
-                with _fetch(info["url"], timeout=60) as resp, open(dest, "wb") as f:
-                    total = int(resp.headers.get("content-length") or 0)
-                    got = 0
-                    while True:
-                        chunk = resp.read(65536)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        got += len(chunk)
-                        if total > 0:
-                            self.update_progress.emit(int(got * 100 / total))
-                size_ok = (not info.get("size")) or os.path.getsize(dest) == info["size"]
-                with open(dest, "rb") as f:
-                    pe_ok = f.read(2) == b"MZ"
-                self.update_downloaded.emit(dest, size_ok, pe_ok)
-            except Exception as e:
-                self.update_failed.emit(str(e))
+            last = ""
+            for attempt in range(3):          # 网络抖动时最多重试 3 次
+                try:
+                    with _fetch(info["url"], timeout=60) as resp, open(dest, "wb") as f:
+                        total = int(resp.headers.get("content-length") or 0)
+                        got = 0
+                        while True:
+                            chunk = resp.read(65536)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            got += len(chunk)
+                            if total > 0:
+                                self.update_progress.emit(int(got * 100 / total))
+                    size_ok = (not info.get("size")) or os.path.getsize(dest) == info["size"]
+                    with open(dest, "rb") as f:
+                        pe_ok = f.read(2) == b"MZ"
+                    self.update_downloaded.emit(dest, size_ok, pe_ok)
+                    return
+                except Exception as e:
+                    last = str(e)
+                    time.sleep(1.5 * (attempt + 1))
+            self.update_failed.emit(last)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1123,6 +1194,7 @@ class JinhuaPyQtApp(QMainWindow):
         self.detail_stats_lines = []
         self.detail_stats_total = 0
         self.output_file_path = ""
+        self.result_data = None      # 清掉上一次结果，避免残留误导
 
         # 找 DLL
         dll = find_engine()
@@ -1200,6 +1272,7 @@ class JinhuaPyQtApp(QMainWindow):
 
     def _on_error(self, msg, data=None):
         data = data or {}
+        self.result_data = data      # 失败也是本次结果，避免页签显示上一次的旧数据
         diag_txt = _diags_text(data)
         fatal = bool(data.get("fatal"))
         # 中断也要把诊断显示在结果页，便于对照排查
@@ -1212,8 +1285,9 @@ class JinhuaPyQtApp(QMainWindow):
             duration = int((time.time() - self._op_start_time) * 1000)
         except Exception:
             duration = 0
-        log_operation(
-            op_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        op_id = log_operation(
+            op_time=now_str,
             operator=os.getlogin(),
             status="error",
             orders=data.get("orders", 0),
@@ -1223,9 +1297,10 @@ class JinhuaPyQtApp(QMainWindow):
             output_file="",
             stats_enabled=1 if self.stats_cb.isChecked() else 0,
             delete_enabled=1 if self.delete_cb.isChecked() else 0,
-            error_msg=(msg + " | " + diag_txt)[:4000],
+            error_msg=(msg + " | " + diag_txt)[:2000],
             duration_ms=duration,
         )
+        log_diagnostics(op_id, data.get("errors") or [], data.get("warnings") or [], now_str)
         self._reset_ui()
 
         box = QMessageBox(self)
@@ -1312,11 +1387,15 @@ class JinhuaPyQtApp(QMainWindow):
 
         self.result_text.setHtml(html)
 
-        # 摘要一行：引导用户切换到「商品明细」页签
-        if self.detail_stats_lines:
+        # 摘要一行：引导用户切换到「商品明细」页签（与页签用同一数据源）
+        rows = self._detail_rows()
+        if rows:
+            try:
+                total_qty = sum(float(r[3]) for r in rows)
+            except Exception:
+                total_qty = 0
             self.result_text.append(
-                f"\n  商品明细共 {sum(1 for l in self.detail_stats_lines if l.strip())} 种"
-                f"（出库 {self.detail_stats_total}），详情见「商品明细」页签\n"
+                f"\n  商品明细共 {len(rows)} 种（出库 {_numstr(total_qty)}），详情见「商品明细」页签\n"
             )
         else:
             self.result_text.append(
@@ -1326,28 +1405,36 @@ class JinhuaPyQtApp(QMainWindow):
         # 填充商品明细表格
         self._populate_detail_table()
 
+    def _detail_rows(self):
+        """商品明细行：(名称, 规格, 单位, 数量)。
+
+        优先用汇总模块读到的**结构化数据**：规格里有没有空格、下划线、多长
+        都不影响分列；只有拿不到结构化数据时，才退回解析引擎的等宽统计行。"""
+        data = (self.result_data or {}).get("_summary")
+        rows = []
+        if data and not data.get("error"):
+            for (name, spec, unit), v in data.get("items", []):
+                rows.append((name, spec, unit, _numstr(sum(v["cust"].values()))))
+            return rows
+        for line in (self.detail_stats_lines or []):
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(self._parse_stats_line(line))
+        return rows
+
     def _populate_detail_table(self):
         self.detail_table.setSortingEnabled(False)
         self.detail_table.setRowCount(0)
 
-        if not self.detail_stats_lines:
+        rows_data = self._detail_rows()
+        if not rows_data:
             self.detail_table.setRowCount(1)
             hint = QTableWidgetItem("暂无数据（可能未勾选统计，或 D:\\明细表格 下无 .xls 文件）")
             hint.setTextAlignment(Qt.AlignCenter)
             hint.setFlags(Qt.NoItemFlags)
             self.detail_table.setItem(0, 0, hint)
             self.detail_table.setSpan(0, 0, 1, 4)
-            return
-
-        rows_data = []
-        for line in self.detail_stats_lines:
-            line = line.strip()
-            if not line:
-                continue
-            name, spec, unit, qty = self._parse_stats_line(line)
-            rows_data.append((name, spec, unit, qty))
-
-        if not rows_data:
             return
 
         self.detail_table.setRowCount(len(rows_data))
@@ -1369,9 +1456,11 @@ class JinhuaPyQtApp(QMainWindow):
 
     @staticmethod
     def _parse_stats_line(line):
-        """解析 Rust 引擎预格式化的统计行: '  名称  规格  单位  数量'
-           引擎使用 Chinese-width 对齐 (中文=4, ASCII=2)
-           已知宽度: name=46, spec=36, unit=10, qty 右对齐 6
+        """【仅回退用，切勿参考其切列方式】把引擎的等宽统计行切成四列。
+
+        它是按空格倒着切（rsplit）的，规格里只要含空格就会串列——历史上
+        “规格跑到单位列” 就是这么来的。正常路径请用 _detail_rows() 的结构化
+        数据，这里只在拿不到结构化数据时兜底。
         """
         # 去掉前导两个空格
         s = line[2:] if len(line) > 2 and line[:2] == "  " else line
@@ -1399,15 +1488,24 @@ class JinhuaPyQtApp(QMainWindow):
         today = datetime.now().strftime('%m%d')
         txt_path = os.path.join(detail_dir, f'今日详情{today}.txt')
         txt_content = self.result_text.toPlainText()
-        if self.detail_stats_lines:
+        # 商品明细统计：直接用结构化数据自己排版（不再依赖引擎的等宽文本反解析）
+        rows = self._detail_rows()
+        if rows:
             w_name, w_spec, w_unit, w_qty = STATS_W
-            nkinds = sum(1 for l in self.detail_stats_lines if l.strip())
-            txt_content += f"\n── 商品明细统计（共 {nkinds} 种，出库总计 {self.detail_stats_total}）──\n"
-            txt_content += f"  {_pad('商品名称', w_name)}{_pad('规格', w_spec)}{_pad('单位', w_unit)}{'数量':>{w_qty}}\n"
+            total_qty = 0.0
+            for *_, q in rows:
+                try:
+                    total_qty += float(q)
+                except Exception:
+                    pass
+            txt_content += ("\n── 商品明细统计（共 %d 种，出库总计 %s）──\n"
+                            % (len(rows), _numstr(total_qty)))
+            txt_content += (f"  {_pad('商品名称', w_name)}{_pad('规格', w_spec)}"
+                            f"{_pad('单位', w_unit)}数量\n")
             txt_content += "  " + "─" * 30 + "\n"
-            for line in self.detail_stats_lines:
-                if line.strip():
-                    txt_content += line + "\n"
+            for name, spec, unit, q in rows:
+                txt_content += (f"  {_pad(name, w_name)}{_pad(spec, w_spec)}"
+                                f"{_pad(unit, w_unit)}{_pad(q, w_qty)}\n")
         with open(txt_path, 'w', encoding='utf-8') as f:
             f.write(txt_content)
 

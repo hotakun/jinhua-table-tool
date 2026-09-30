@@ -287,8 +287,28 @@ pub(crate) fn compute_stats() -> (Vec<String>, i64) {
     (lines, total)
 }
 
-/// 等宽填充（与 engine.rs 的 pad 一致）
-fn pad_(s: &str, w: usize) -> String { format!("{}{}", s, " ".repeat(w.saturating_sub(dw(s)))) }
+/// 等宽填充：内容超宽时按显示宽度截断并补 "…"，保证后面的列不被顶歪
+/// （例如规格 '570/580/680/850/960特厚大*1800个' 显示宽度 64 > 36，
+///   以前只补空格不截断，会把「单位」「数量」整体往右顶，看起来像串列）
+fn pad_(s: &str, w: usize) -> String {
+    let cur = dw(s);
+    if cur <= w {
+        return format!("{}{}", s, " ".repeat(w - cur));
+    }
+    let limit = w.saturating_sub(2);        // 给 "…"（显示宽度 2）留位置
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let cw = if ch as u32 > 0x2E80 { 4 } else { 2 };
+        if used + cw > limit { break; }
+        out.push(ch);
+        used += cw;
+    }
+    out.push('…');
+    used += 2;
+    if used < w { out.push_str(&" ".repeat(w - used)); }
+    out
+}
 
 pub(crate) fn count_products(dir: &str) -> i64 {
     let mut t = 0i64;
