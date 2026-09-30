@@ -493,7 +493,7 @@ def build_html(data):
             '<span class="cnm">%s</span>'
             '<span class="tq">%s</span>'
             '</summary><ul>%s</ul></details>'
-            % (esc(code), esc(text), "#eef6ff",     # 客户栏统一淡蓝
+            % (esc(code), esc(text), "#eefaf1",     # 客户栏统一淡绿
                esc(cu), num(sum(r[3] for r in rows)), lis))
 
     warn = ""
