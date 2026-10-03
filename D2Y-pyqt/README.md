@@ -1,10 +1,10 @@
-# D2Y-pyqt — PySide6 版（v3.2.0，发布主线）
+# D2Y-pyqt — PySide6 版（v3.2.1，发布主线）
 
 与 `D2Y/` 的 ttkbootstrap 版**共用同一份 Rust 引擎 DLL**（`jinhua_engine.dll`，源码在 `..\D2Y\Rust\src\engine.rs`），GUI 层用 PySide6 重写。
 最初是对比练习项目，现已转正为发布主线。详细设计见 `开发文档.md`。
 
 - 上一个安装包：[GitHub Releases v3.1.2](https://github.com/hotakun/jinhua-table-tool/releases/tag/v3.1.2)
-- 本地安装包：`installer/金华聚火表格处理_v3.2.0_Setup.exe`
+- 本地安装包：`installer/金华聚火表格处理_v3.2.1_Setup.exe`
 
 ## 文件结构
 

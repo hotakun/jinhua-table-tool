@@ -139,6 +139,11 @@ pub(crate) const COORD_FIELDS: &[FieldSpec] = &[
         exclude: &["编码", "编号", "地址", "电话"] },
     FieldSpec { key: "coord", label: "地图经纬度", required: true,
         exact: &["地图经纬度"], alias: &["经纬度", "坐标"], exclude: &[] },
+    // 地址：**同编号多店铺时的唯一区分依据**（店名可能只差括号里几个字，
+    // 甚至被误录成完全一样）。没有它就只能留空报警。
+    FieldSpec { key: "ad", label: "地址", required: false,
+        exact: &["地址"], alias: &["详细地址", "收货地址", "门店地址", "送货地址"],
+        exclude: &[] },
 ];
 
 /// 某列是否命中字段：先查排除词，再按 pass 决定用精确名还是别名

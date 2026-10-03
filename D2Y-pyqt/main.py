@@ -35,7 +35,7 @@ from PySide6.QtGui import (
 # ============================================================================
 # 常量
 # ============================================================================
-CURRENT_VERSION = "3.2.0"
+CURRENT_VERSION = "3.2.1"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 操作日志数据库
 LOG_DB_DIR = r"D:\订单表格\logs"
